@@ -1104,20 +1104,20 @@ picoclaw agent -m "Hello"
 
 ## CLI Reference
 
-| Command                        | Description                         |
-| ------------------------------ | ----------------------------------- |
-| `picoclaw onboard`             | Initialize config & workspace       |
-| `picoclaw agent -m "..."` | Chat with the agent                 |
-| `picoclaw agent`               | Interactive chat mode               |
-| `picoclaw gateway`             | Start the gateway                   |
-| `picoclaw status`              | Show status                         |
-| `picoclaw skills list`         | List installed skills               |
-| `picoclaw skills install <repo>` | Install skill from GitHub          |
-| `picoclaw skills install --registry <name> <slug>` | Install from registry |
-| `picoclaw skills remove <name>` | Remove installed skill              |
-| `picoclaw skills search`       | Search available skills             |
-| `picoclaw cron list`           | List all scheduled jobs             |
-| `picoclaw cron add ...`        | Add a scheduled job                  |
+| Command                                            | Description                         |
+| -------------------------------------------------- | ----------------------------------- |
+| `picoclaw onboard`                                 | Initialize config & workspace       |
+| `picoclaw agent -m "..."`                          | Chat with the agent                 |
+| `picoclaw agent`                                   | Interactive chat mode               |
+| `picoclaw gateway`                                 | Start the gateway                   |
+| `picoclaw status`                                  | Show status                         |
+| `picoclaw skills list`                             | List installed skills               |
+| `picoclaw skills install <repo>`                   | Install skill from GitHub           |
+| `picoclaw skills install --registry <name> <slug>` | Install from registry               |
+| `picoclaw skills remove <name>`                    | Remove installed skill              |
+| `picoclaw skills search`                           | Search available skills             |
+| `picoclaw cron list`                               | List all scheduled jobs             |
+| `picoclaw cron add ...`                            | Add a scheduled job                 |
 
 ### Scheduled Tasks / Reminders
 
@@ -1156,7 +1156,7 @@ picoclaw skills install --registry clawhub opencode-controller
 
 | Registry   | Description                          |
 | ---------- | ------------------------------------ |
-| `clawhub`  | ClawHub skill registry (default) |
+| `clawhub`  | ClawHub skill registry (default)     |
 
 **Configuration:**
 
