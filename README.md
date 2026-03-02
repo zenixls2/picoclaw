@@ -1156,7 +1156,7 @@ picoclaw skills install --registry clawhub opencode-controller
 
 | Registry   | Description                          |
 | ---------- | ------------------------------------ |
-| `clawhub`  | ClawHub skill registry (default)    |
+| `clawhub`  | ClawHub skill registry (default) |
 
 **Configuration:**
 
