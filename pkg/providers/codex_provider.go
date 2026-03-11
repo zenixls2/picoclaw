@@ -10,6 +10,7 @@ import (
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 
 	"github.com/sipeed/picoclaw/pkg/auth"
 	"github.com/sipeed/picoclaw/pkg/logger"
@@ -101,9 +102,14 @@ func (p *CodexProvider) Chat(
 	defer stream.Close()
 
 	var resp *responses.Response
+	streamedOutputItems := make(map[int64]responses.ResponseOutputItemUnion)
 	for stream.Next() {
 		evt := stream.Current()
-		if evt.Type == "response.completed" || evt.Type == "response.failed" || evt.Type == "response.incomplete" {
+		switch evt.Type {
+		case "response.output_item.done":
+			done := evt.AsResponseOutputItemDone()
+			streamedOutputItems[done.OutputIndex] = done.Item
+		case "response.completed", "response.failed", "response.incomplete":
 			evtResp := evt.Response
 			if evtResp.ID != "" {
 				evtRespCopy := evtResp
@@ -149,8 +155,36 @@ func (p *CodexProvider) Chat(
 		logger.ErrorCF("provider.codex", "Codex stream ended without completed response event", fields)
 		return nil, fmt.Errorf("codex API call: stream ended without completed response")
 	}
+	mergeCodexStreamedOutput(resp, streamedOutputItems)
 
 	return parseCodexResponse(resp), nil
+}
+
+func mergeCodexStreamedOutput(resp *responses.Response, streamed map[int64]responses.ResponseOutputItemUnion) {
+	if resp == nil || len(streamed) == 0 {
+		return
+	}
+
+	mergedLen := len(resp.Output)
+	for idx := range streamed {
+		if needed := int(idx) + 1; needed > mergedLen {
+			mergedLen = needed
+		}
+	}
+	if mergedLen == 0 {
+		return
+	}
+
+	merged := make([]responses.ResponseOutputItemUnion, mergedLen)
+	copy(merged, resp.Output)
+	for idx, item := range streamed {
+		if idx < 0 {
+			continue
+		}
+		merged[int(idx)] = item
+	}
+
+	resp.Output = merged
 }
 
 func (p *CodexProvider) GetDefaultModel() string {
@@ -305,7 +339,16 @@ func buildCodexParams(
 		params.Tools = translateToolsForCodex(tools, enableWebSearch)
 	}
 
+	if codexModelSupportsReasoningSummary(model) {
+		params.Reasoning = shared.ReasoningParam{Summary: shared.ReasoningSummaryAuto}
+	}
+
 	return params
+}
+
+func codexModelSupportsReasoningSummary(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "gpt-5") || strings.HasPrefix(m, "o3") || strings.HasPrefix(m, "o4")
 }
 
 func resolveCodexToolCall(tc ToolCall) (name string, arguments string, ok bool) {
@@ -363,10 +406,19 @@ func translateToolsForCodex(tools []ToolDefinition, enableWebSearch bool) []resp
 
 func parseCodexResponse(resp *responses.Response) *LLMResponse {
 	var content strings.Builder
+	var reasoning strings.Builder
 	var toolCalls []ToolCall
 
 	for _, item := range resp.Output {
 		switch item.Type {
+		case "reasoning":
+			reasoningText := extractCodexReasoningText(item)
+			if reasoningText != "" {
+				if reasoning.Len() > 0 {
+					reasoning.WriteString("\n\n")
+				}
+				reasoning.WriteString(reasoningText)
+			}
 		case "message":
 			for _, c := range item.Content {
 				if c.Type == "output_text" {
@@ -403,12 +455,40 @@ func parseCodexResponse(resp *responses.Response) *LLMResponse {
 		}
 	}
 
-	return &LLMResponse{
-		Content:      content.String(),
-		ToolCalls:    toolCalls,
-		FinishReason: finishReason,
-		Usage:        usage,
+	reasoningText := reasoning.String()
+	reasoningContent := ""
+	if content.Len() == 0 {
+		reasoningContent = reasoningText
 	}
+
+	return &LLMResponse{
+		Content:          content.String(),
+		Reasoning:        reasoningText,
+		ReasoningContent: reasoningContent,
+		ToolCalls:        toolCalls,
+		FinishReason:     finishReason,
+		Usage:            usage,
+	}
+}
+
+func extractCodexReasoningText(item responses.ResponseOutputItemUnion) string {
+	parts := make([]string, 0, len(item.Summary)+len(item.Content))
+	for _, summary := range item.Summary {
+		if summary.Text != "" {
+			parts = append(parts, summary.Text)
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n\n")
+	}
+
+	for _, content := range item.AsReasoning().Content {
+		if content.Text != "" {
+			parts = append(parts, content.Text)
+		}
+	}
+
+	return strings.Join(parts, "\n\n")
 }
 
 func createCodexTokenSource() func() (string, string, error) {

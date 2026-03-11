@@ -783,8 +783,8 @@ func (al *AgentLoop) runAgentLoop(
 	// 4. Handle empty/placeholder response
 	if shouldRetryOnEmptyLikeResponse(finalContent, opts.DefaultResponse) {
 		logger.WarnCF("agent", "Detected empty/placeholder response; retrying once with compact context", map[string]any{
-			"agent_id":    agent.ID,
-			"session_key": opts.SessionKey,
+			"agent_id":     agent.ID,
+			"session_key":  opts.SessionKey,
 			"response_len": len(finalContent),
 		})
 
@@ -815,8 +815,10 @@ func (al *AgentLoop) runAgentLoop(
 		finalContent = opts.DefaultResponse
 	}
 
-	// 5. Save final assistant message to session
-	agent.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
+	historyAfterRun := agent.Sessions.GetHistory(opts.SessionKey)
+	if len(historyAfterRun) == 0 || historyAfterRun[len(historyAfterRun)-1].Role != "assistant" {
+		agent.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
+	}
 	agent.Sessions.Save(opts.SessionKey)
 
 	// 6. Optional: summarization
@@ -922,6 +924,15 @@ func (al *AgentLoop) runLLMIteration(
 ) (string, int, error) {
 	iteration := 0
 	var finalContent string
+
+	// toolsExecutedLastIter tracks whether the previous iteration dispatched tool
+	// calls and received results.  This lets us distinguish two "empty content,
+	// no tool calls" situations:
+	//   • post-tool thinking  – model is digesting tool results before replying
+	//   • pre-answer thinking – model is reasoning before its first real answer
+	// Both cases continue the loop, but the log context is different and future
+	// policy (e.g. a max-thinking-turns guard) can branch on this flag.
+	toolsExecutedLastIter := false
 
 	// Determine effective model tier for this conversation turn.
 	// selectCandidates evaluates routing once and the decision is sticky for
@@ -1100,23 +1111,54 @@ func (al *AgentLoop) runLLMIteration(
 				"iteration":      iteration,
 				"content_chars":  len(response.Content),
 				"tool_calls":     len(response.ToolCalls),
+				"finish_reason":  response.FinishReason,
 				"reasoning":      response.Reasoning,
 				"target_channel": al.targetReasoningChannelID(opts.Channel),
 				"channel":        opts.Channel,
 			})
-		// Check if no tool calls - then check reasoning content if any
+
+		finalContent = response.Content + response.ReasoningContent
 		if len(response.ToolCalls) == 0 {
-			finalContent = response.Content
-			if finalContent == "" && response.ReasoningContent != "" {
-				finalContent = response.ReasoningContent
+			if finalContent != "" {
+				lastMsg := providers.Message{
+					Role:             "assistant",
+					Content:          response.Content,
+					ReasoningContent: response.ReasoningContent + response.Reasoning,
+				}
+
+				agent.Sessions.AddFullMessage(opts.SessionKey, lastMsg)
+				messages = append(messages, lastMsg)
+				if toolsExecutedLastIter {
+					logger.InfoCF("agent", "LLM synthesized answer after tool execution",
+						map[string]any{
+							"agent_id":      agent.ID,
+							"iteration":     iteration,
+							"content_chars": len(finalContent),
+						})
+					break
+				} else {
+					if response.ReasoningContent == "" &&
+						response.Reasoning == "" {
+						logger.InfoCF("agent", "LLM last response without tool calls (direct answer)",
+							map[string]any{
+								"agent_id":      agent.ID,
+								"iteration":     iteration,
+								"content_chars": len(finalContent),
+							})
+					}
+					// reasoning, internal message
+					toolsExecutedLastIter = false
+					continue
+				}
+			} else {
+				logger.DebugCF("agent", "Empty content after tool results",
+					map[string]any{
+						"agent_id":      agent.ID,
+						"iteration":     iteration,
+						"has_reasoning": response.ReasoningContent != "",
+					})
+				break
 			}
-			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
-				map[string]any{
-					"agent_id":      agent.ID,
-					"iteration":     iteration,
-					"content_chars": len(finalContent),
-				})
-			break
 		}
 
 		normalizedToolCalls := make([]providers.ToolCall, 0, len(response.ToolCalls))
@@ -1304,6 +1346,7 @@ func (al *AgentLoop) runLLMIteration(
 			// Save tool result message to session
 			agent.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
 		}
+		toolsExecutedLastIter = true
 
 		// Tick down TTL of discovered tools after processing tool results.
 		// Only reached when tool calls were made (the loop continues);

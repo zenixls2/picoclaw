@@ -437,6 +437,9 @@ func TestProcessMessage_UsesRouteSessionKey(t *testing.T) {
 	if history[0].Role != "user" || history[0].Content != "hello" {
 		t.Fatalf("unexpected first message in session: %+v", history[0])
 	}
+	if history[1].Role != "assistant" || history[1].Content != "ok" {
+		t.Fatalf("unexpected second message in session: %+v", history[1])
+	}
 }
 
 func TestProcessMessage_CommandOutcomes(t *testing.T) {
@@ -688,6 +691,82 @@ func (m *failFirstMockProvider) GetDefaultModel() string {
 	return "mock-fail-model"
 }
 
+type sequentialResponseProvider struct {
+	responses []*providers.LLMResponse
+	callCount int
+}
+
+func (m *sequentialResponseProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	idx := m.callCount
+	m.callCount++
+	if idx >= len(m.responses) {
+		return &providers.LLMResponse{ToolCalls: []providers.ToolCall{}}, nil
+	}
+	resp := *m.responses[idx]
+	if resp.ToolCalls == nil {
+		resp.ToolCalls = []providers.ToolCall{}
+	}
+	return &resp, nil
+}
+
+func (m *sequentialResponseProvider) GetDefaultModel() string {
+	return "sequential-mock-model"
+}
+
+type toolDigestProvider struct {
+	callCount int
+}
+
+func (m *toolDigestProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.callCount++
+	hasToolResult := false
+	for _, msg := range messages {
+		if msg.Role == "tool" && msg.ToolCallID == "tc1" && msg.Content == "Custom tool executed" {
+			hasToolResult = true
+			break
+		}
+	}
+
+	if !hasToolResult {
+		return &providers.LLMResponse{
+			ToolCalls: []providers.ToolCall{{
+				ID:        "tc1",
+				Type:      "function",
+				Name:      "mock_custom",
+				Arguments: map[string]any{},
+			}},
+		}, nil
+	}
+
+	if m.callCount == 2 {
+		return &providers.LLMResponse{
+			Reasoning: "digesting tool output",
+			ToolCalls: []providers.ToolCall{},
+		}, nil
+	}
+
+	return &providers.LLMResponse{
+		Content:   "FINAL",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *toolDigestProvider) GetDefaultModel() string {
+	return "tool-digest-mock-model"
+}
+
 // TestAgentLoop_ContextExhaustionRetry verify that the agent retries on context errors
 func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
@@ -767,6 +846,65 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	// Without compression: 6 + 1 (new user msg) + 1 (assistant msg) = 8
 	if len(finalHistory) >= 8 {
 		t.Errorf("Expected history to be compressed (len < 8), got %d", len(finalHistory))
+	}
+}
+
+func TestAgentLoop_EmptyNoToolCallTurn_DoesNotExitPrematurely(t *testing.T) {
+	al, _, _, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	provider := &sequentialResponseProvider{
+		responses: []*providers.LLMResponse{
+			{Reasoning: "thinking step 1"},
+			{Reasoning: "thinking step 2"},
+			{Content: "FINAL"},
+		},
+	}
+	al.registry.GetDefaultAgent().Provider = provider
+
+	response, err := al.ProcessDirectWithChannel(
+		context.Background(),
+		"Trigger message",
+		"test-session-empty-thinking",
+		"cli",
+		"direct",
+	)
+	if err != nil {
+		t.Fatalf("ProcessDirectWithChannel failed: %v", err)
+	}
+
+	if response != "FINAL" {
+		t.Fatalf("expected FINAL, got %q", response)
+	}
+	if provider.callCount != 3 {
+		t.Fatalf("expected 3 provider calls, got %d", provider.callCount)
+	}
+}
+
+func TestAgentLoop_PostToolEmptyNoToolCallTurn_ContinuesUntilAnswer(t *testing.T) {
+	al, _, _, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	provider := &toolDigestProvider{}
+	al.registry.GetDefaultAgent().Provider = provider
+	al.RegisterTool(&mockCustomTool{})
+
+	response, err := al.ProcessDirectWithChannel(
+		context.Background(),
+		"Trigger message",
+		"test-session-tool-digest",
+		"cli",
+		"direct",
+	)
+	if err != nil {
+		t.Fatalf("ProcessDirectWithChannel failed: %v", err)
+	}
+
+	if response != "FINAL" {
+		t.Fatalf("expected FINAL, got %q", response)
+	}
+	if provider.callCount != 3 {
+		t.Fatalf("expected 3 provider calls, got %d", provider.callCount)
 	}
 }
 

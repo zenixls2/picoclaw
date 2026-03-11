@@ -32,6 +32,16 @@ func TestBuildCodexParams_BasicMessage(t *testing.T) {
 	if params.MaxOutputTokens.Valid() {
 		t.Fatalf("MaxOutputTokens should not be set for Codex backend")
 	}
+	if params.Reasoning.Summary != "" {
+		t.Fatalf("Reasoning summary should not be set for non-reasoning models")
+	}
+}
+
+func TestBuildCodexParams_ReasoningSummaryEnabledForReasoningModels(t *testing.T) {
+	params := buildCodexParams([]Message{{Role: "user", Content: "Hi"}}, nil, "gpt-5.2", map[string]any{}, true)
+	if params.Reasoning.Summary != "auto" {
+		t.Fatalf("Reasoning.Summary = %q, want %q", params.Reasoning.Summary, "auto")
+	}
 }
 
 func TestBuildCodexParams_SystemAsInstructions(t *testing.T) {
@@ -285,6 +295,97 @@ func TestParseCodexResponse_FunctionCall(t *testing.T) {
 	}
 }
 
+func TestParseCodexResponse_ReasoningOnly(t *testing.T) {
+	respJSON := `{
+		"id": "resp_test",
+		"object": "response",
+		"status": "completed",
+		"output": [
+			{
+				"id": "rs_1",
+				"type": "reasoning",
+				"summary": [
+					{"type": "summary_text", "text": "Thinking through the next tool call."}
+				],
+				"status": "completed"
+			}
+		],
+		"usage": {
+			"input_tokens": 10,
+			"output_tokens": 8,
+			"total_tokens": 18,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 4}
+		}
+	}`
+
+	var resp responses.Response
+	if err := json.Unmarshal([]byte(respJSON), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	result := parseCodexResponse(&resp)
+	if result.Content != "" {
+		t.Fatalf("Content = %q, want empty", result.Content)
+	}
+	if result.Reasoning != "Thinking through the next tool call." {
+		t.Fatalf("Reasoning = %q, want reasoning summary", result.Reasoning)
+	}
+	if result.ReasoningContent != "Thinking through the next tool call." {
+		t.Fatalf("ReasoningContent = %q, want reasoning summary", result.ReasoningContent)
+	}
+}
+
+func TestParseCodexResponse_ReasoningWithMessage(t *testing.T) {
+	respJSON := `{
+		"id": "resp_test",
+		"object": "response",
+		"status": "completed",
+		"output": [
+			{
+				"id": "rs_1",
+				"type": "reasoning",
+				"summary": [
+					{"type": "summary_text", "text": "I can answer directly."}
+				],
+				"status": "completed"
+			},
+			{
+				"id": "msg_1",
+				"type": "message",
+				"role": "assistant",
+				"status": "completed",
+				"content": [
+					{"type": "output_text", "text": "Here is the answer."}
+				]
+			}
+		],
+		"usage": {
+			"input_tokens": 10,
+			"output_tokens": 8,
+			"total_tokens": 18,
+			"input_tokens_details": {"cached_tokens": 0},
+			"output_tokens_details": {"reasoning_tokens": 4}
+		}
+	}`
+
+	var resp responses.Response
+	if err := json.Unmarshal([]byte(respJSON), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	result := parseCodexResponse(&resp)
+	if result.Content != "Here is the answer." {
+		t.Fatalf("Content = %q, want %q", result.Content, "Here is the answer.")
+	}
+	if result.Reasoning != "I can answer directly." {
+		t.Fatalf("Reasoning = %q, want reasoning summary", result.Reasoning)
+	}
+	if result.ReasoningContent != "" {
+		t.Fatalf("ReasoningContent = %q, want empty", result.ReasoningContent)
+	}
+}
+
 func TestCodexProvider_ChatRoundTrip(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
@@ -311,6 +412,11 @@ func TestCodexProvider_ChatRoundTrip(t *testing.T) {
 		}
 		if _, ok := reqBody["max_output_tokens"]; ok {
 			http.Error(w, "max_output_tokens is not supported", http.StatusBadRequest)
+			return
+		}
+		reasoning, ok := reqBody["reasoning"].(map[string]any)
+		if !ok || reasoning["summary"] != "auto" {
+			http.Error(w, "expected reasoning summary auto", http.StatusBadRequest)
 			return
 		}
 		toolsAny, ok := reqBody["tools"].([]any)
@@ -355,7 +461,7 @@ func TestCodexProvider_ChatRoundTrip(t *testing.T) {
 	provider.client = createOpenAITestClient(server.URL, "test-token", "acc-123")
 
 	messages := []Message{{Role: "user", Content: "Hello"}}
-	resp, err := provider.Chat(t.Context(), messages, nil, "gpt-4o", map[string]any{"max_tokens": 1024})
+	resp, err := provider.Chat(t.Context(), messages, nil, "gpt-5.2", map[string]any{"max_tokens": 1024})
 	if err != nil {
 		t.Fatalf("Chat() error: %v", err)
 	}
@@ -367,6 +473,88 @@ func TestCodexProvider_ChatRoundTrip(t *testing.T) {
 	}
 	if resp.Usage.TotalTokens != 18 {
 		t.Errorf("TotalTokens = %d, want 18", resp.Usage.TotalTokens)
+	}
+}
+
+func TestCodexProvider_ChatRoundTrip_MergesStreamedReasoningOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+
+		resp := map[string]any{
+			"id":     "resp_test",
+			"object": "response",
+			"status": "completed",
+			"output": []map[string]any{
+				{
+					"id":     "msg_1",
+					"type":   "message",
+					"role":   "assistant",
+					"status": "completed",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "Need to call a tool."},
+					},
+				},
+			},
+			"usage": map[string]any{
+				"input_tokens":          12,
+				"output_tokens":         6,
+				"total_tokens":          18,
+				"input_tokens_details":  map[string]any{"cached_tokens": 0},
+				"output_tokens_details": map[string]any{"reasoning_tokens": 3},
+			},
+		}
+
+		events := []map[string]any{
+			{
+				"type":            "response.output_item.done",
+				"sequence_number": 1,
+				"output_index":    0,
+				"item": map[string]any{
+					"id":      "rs_1",
+					"type":    "reasoning",
+					"summary": []map[string]any{{"type": "summary_text", "text": "Thinking through the tool choice."}},
+					"status":  "completed",
+				},
+			},
+			{
+				"type":            "response.output_item.done",
+				"sequence_number": 2,
+				"output_index":    1,
+				"item": map[string]any{
+					"id":      "msg_1",
+					"type":    "message",
+					"role":    "assistant",
+					"status":  "completed",
+					"content": []map[string]any{{"type": "output_text", "text": "Need to call a tool."}},
+				},
+			},
+			{
+				"type":            "response.completed",
+				"sequence_number": 3,
+				"response":        resp,
+			},
+		}
+
+		writeSSEEvents(w, events)
+	}))
+	defer server.Close()
+
+	provider := NewCodexProvider("test-token", "acc-123")
+	provider.client = createOpenAITestClient(server.URL, "test-token", "acc-123")
+
+	messages := []Message{{Role: "user", Content: "Hello"}}
+	got, err := provider.Chat(t.Context(), messages, nil, "gpt-5.2", nil)
+	if err != nil {
+		t.Fatalf("Chat() error: %v", err)
+	}
+	if got.Reasoning != "Thinking through the tool choice." {
+		t.Fatalf("Reasoning = %q, want streamed reasoning summary", got.Reasoning)
+	}
+	if got.Content != "Need to call a tool." {
+		t.Fatalf("Content = %q, want %q", got.Content, "Need to call a tool.")
 	}
 }
 
@@ -632,14 +820,19 @@ func createOpenAITestClient(baseURL, token, accountID string) *openai.Client {
 }
 
 func writeCompletedSSE(w http.ResponseWriter, response map[string]any) {
-	event := map[string]any{
+	w.Header().Set("Content-Type", "text/event-stream")
+	writeSSEEvents(w, []map[string]any{{
 		"type":            "response.completed",
 		"sequence_number": 1,
 		"response":        response,
+	}})
+}
+
+func writeSSEEvents(w http.ResponseWriter, events []map[string]any) {
+	for _, event := range events {
+		b, _ := json.Marshal(event)
+		fmt.Fprintf(w, "event: %s\n", event["type"])
+		fmt.Fprintf(w, "data: %s\n\n", string(b))
 	}
-	b, _ := json.Marshal(event)
-	w.Header().Set("Content-Type", "text/event-stream")
-	fmt.Fprintf(w, "event: response.completed\n")
-	fmt.Fprintf(w, "data: %s\n\n", string(b))
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 }
