@@ -780,7 +780,37 @@ func (al *AgentLoop) runAgentLoop(
 	// If last tool had ForUser content and we already sent it, we might not need to send final response
 	// This is controlled by the tool's Silent flag and ForUser content
 
-	// 4. Handle empty response
+	// 4. Handle empty/placeholder response
+	if shouldRetryOnEmptyLikeResponse(finalContent, opts.DefaultResponse) {
+		logger.WarnCF("agent", "Detected empty/placeholder response; retrying once with compact context", map[string]any{
+			"agent_id":    agent.ID,
+			"session_key": opts.SessionKey,
+			"response_len": len(finalContent),
+		})
+
+		retryMessages := agent.ContextBuilder.BuildMessages(
+			nil,
+			summary,
+			opts.UserMessage,
+			opts.Media,
+			opts.Channel,
+			opts.ChatID,
+		)
+		retryMessages = resolveMediaRefs(retryMessages, al.mediaStore, maxMediaSize)
+
+		retryContent, retryIteration, retryErr := al.runLLMIteration(ctx, agent, retryMessages, opts)
+		if retryErr != nil {
+			logger.WarnCF("agent", "Single retry after empty/placeholder response failed", map[string]any{
+				"agent_id":    agent.ID,
+				"session_key": opts.SessionKey,
+				"error":       retryErr.Error(),
+			})
+		} else {
+			finalContent = retryContent
+			iteration += retryIteration
+		}
+	}
+
 	if finalContent == "" {
 		finalContent = opts.DefaultResponse
 	}
@@ -814,6 +844,17 @@ func (al *AgentLoop) runAgentLoop(
 		})
 
 	return finalContent, nil
+}
+
+func shouldRetryOnEmptyLikeResponse(finalContent, defaultResponse string) bool {
+	trimmed := strings.TrimSpace(finalContent)
+	if trimmed == "" {
+		return true
+	}
+	if defaultResponse != "" && trimmed == strings.TrimSpace(defaultResponse) {
+		return true
+	}
+	return false
 }
 
 func (al *AgentLoop) targetReasoningChannelID(channelName string) (chatID string) {
